@@ -1,0 +1,40 @@
+[package]
+name = "common-feeder"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+# Common-media feeder sidecar: Wikimedia Commons + Giphy. Wikimedia is always
+# on; Giphy is opt-in (needs an API key) and soft-skips unless GIPHY_API_KEY is
+# set in this feeder's own env. Preview thumbnails ride as raw `preview_url`
+# fields — the gateway core fetches + seeds + rewrites them to `preview` cids
+# (a feeder can't reach the core bitswap blockstore).
+
+[lib]
+name = "common_feeder"
+path = "src/lib.rs"
+
+[[bin]]
+name = "common-feeder"
+path = "src/main.rs"
+
+[dependencies]
+meta-feeder-sdk = { path = "../../crates/meta-feeder-sdk" }
+
+tokio = { version = "1.40", features = ["full"] }
+axum = { version = "0.7", features = ["json"] }
+anyhow = "1"
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", features = ["json", "rustls-tls", "stream"], default-features = false }
+bytes = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+[dev-dependencies]
+wiremock = "0.6"
+tempfile = "3"
+tokio = { version = "1.40", features = ["full", "test-util"] }

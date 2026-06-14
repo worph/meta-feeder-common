@@ -1,0 +1,245 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>feeder config</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 18px;
+    font: 14px/1.5 system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+    background: #0d0d12; color: #e6e6ea;
+  }
+  h1 { font-size: 16px; margin: 0 0 4px; }
+  .sub { color: #9a9aa6; font-size: 12px; margin: 0 0 16px; }
+  .field { margin: 0 0 16px; }
+  .field > label { display: block; font-weight: 600; margin: 0 0 4px; }
+  .help { color: #8a8a96; font-size: 12px; margin: 3px 0 0; }
+  input[type=text], input[type=password], input[type=number], textarea {
+    width: 100%; padding: 8px 10px; border-radius: 8px;
+    border: 1px solid #2a2a35; background: #15151c; color: #e6e6ea; font: inherit;
+  }
+  textarea { min-height: 56px; resize: vertical; }
+  input[type=checkbox] { width: 16px; height: 16px; vertical-align: middle; }
+  .pill { font-size: 10px; padding: 2px 7px; border-radius: 999px; margin-left: 8px; vertical-align: middle; }
+  .pill.set { background: #14361f; color: #6ee7a0; border: 1px solid #1f5132; }
+  .pill.unset { background: #2a2a35; color: #b9b9c4; border: 1px solid #3a3a45; }
+  .record { border: 1px solid #2a2a35; border-radius: 10px; padding: 12px; margin: 0 0 10px; background: #111118; }
+  .record .field { margin-bottom: 10px; }
+  .row-actions { text-align: right; }
+  button {
+    font: inherit; cursor: pointer; border-radius: 8px; padding: 7px 14px;
+    border: 1px solid #3a3a45; background: #1c1c26; color: #e6e6ea;
+  }
+  button.primary { background: #6d4aff; border-color: #6d4aff; color: #fff; font-weight: 600; }
+  button.danger { background: transparent; border-color: #5a2a2a; color: #e29; padding: 4px 10px; }
+  button.add { margin-top: 4px; }
+  .bar { position: sticky; bottom: 0; padding: 12px 0 2px; background: linear-gradient(#0d0d1200, #0d0d12 30%); }
+  .banner { padding: 9px 12px; border-radius: 8px; margin: 0 0 14px; font-size: 13px; display: none; }
+  .banner.ok { background: #14361f; color: #9ff0bf; border: 1px solid #1f5132; display: block; }
+  .banner.warn { background: #3a2f12; color: #f0d79f; border: 1px solid #5a4a1f; display: block; }
+  .banner.err { background: #3a1414; color: #f0a0a0; border: 1px solid #5a2020; display: block; }
+  .empty { color: #9a9aa6; }
+</style>
+</head>
+<body>
+  <h1 id="title">Plugin configuration</h1>
+  <p class="sub">Secrets are write-only — set values are shown as “set”, never echoed back. Saving requires a feeder restart to take effect.</p>
+  <div id="banner" class="banner"></div>
+  <form id="form"></form>
+  <div class="bar" id="bar" style="display:none">
+    <button type="button" class="primary" id="save">Save</button>
+  </div>
+
+<script>
+// All API calls are relative to this page's path, so the same page works when
+// served directly on the feeder (/config) or reverse-proxied through the
+// gateway (/api/gateway/plugins/<id>/ui/config).
+const BASE = location.pathname.replace(/\/+$/, "");
+let SCHEMA = { fields: [] };
+let VALUES = {};
+
+const $ = (id) => document.getElementById(id);
+function banner(kind, msg) {
+  const b = $("banner");
+  b.className = "banner " + kind;
+  b.textContent = msg;
+}
+
+function el(tag, attrs, ...kids) {
+  const e = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs || {})) {
+    if (k === "class") e.className = v;
+    else if (k === "text") e.textContent = v;
+    else if (k in e) e[k] = v;
+    else e.setAttribute(k, v);
+  }
+  for (const c of kids) if (c != null) e.append(c);
+  return e;
+}
+
+// Split help text into plain runs + clickable <a> nodes for any http(s) URL.
+// Built as DOM nodes (never innerHTML) so help stays XSS-safe; trailing
+// punctuation is kept outside the link so "see http://host/ui." reads right.
+function linkify(text) {
+  const out = [];
+  const re = /https?:\/\/[^\s]+/g;
+  let last = 0, m;
+  while ((m = re.exec(text)) !== null) {
+    if (m.index > last) out.push(text.slice(last, m.index));
+    let url = m[0], trail = "";
+    const t = url.match(/[.,;:)\]]+$/);
+    if (t) { trail = t[0]; url = url.slice(0, -trail.length); }
+    out.push(el("a", { href: url, target: "_blank", rel: "noopener noreferrer", text: url }));
+    if (trail) out.push(trail);
+    last = m.index + m[0].length;
+  }
+  if (last < text.length) out.push(text.slice(last));
+  return out;
+}
+
+function helpEl(f) { return f.help ? el("p", { class: "help" }, ...linkify(f.help)) : null; }
+
+// Render one scalar field. `vals` is the object holding the value/`_set` flag.
+function fieldInput(f, vals) {
+  if (f.type === "bool") {
+    const cb = el("input", { type: "checkbox" });
+    cb.checked = vals[f.key] === true;
+    cb._get = () => cb.checked;
+    return el("label", {}, cb, " ", el("span", { text: " " + f.label }));
+  }
+  const label = el("label", { text: f.label });
+  let input;
+  if (f.type === "secret") {
+    const isSet = vals[f.key + "_set"] === true;
+    input = el("input", { type: "password", placeholder: isSet ? "•••••••• (blank keeps current)" : "not set" });
+    label.append(el("span", { class: "pill " + (isSet ? "set" : "unset"), text: isSet ? "set" : "not set" }));
+    input._get = () => input.value; // blank => merge keeps stored secret
+  } else if (f.type === "number") {
+    input = el("input", { type: "number" });
+    if (vals[f.key] != null) input.value = vals[f.key];
+    input._get = () => (input.value === "" ? null : Number(input.value));
+  } else if (f.type === "list") {
+    input = el("textarea", { placeholder: "one per line or comma-separated" });
+    const arr = Array.isArray(vals[f.key]) ? vals[f.key] : [];
+    input.value = arr.join("\n");
+    input._get = () => input.value.split(/[\n,]/).map((s) => s.trim()).filter(Boolean);
+  } else {
+    input = el("input", { type: "text" });
+    if (vals[f.key] != null) input.value = vals[f.key];
+    input._get = () => input.value;
+  }
+  const wrap = el("div", { class: "field" }, label, input, helpEl(f));
+  wrap._collect = () => input._get();
+  wrap._key = f.key;
+  // bool path returns a <label>; normalize collect/key for it
+  if (f.type === "bool") {
+    const w = el("div", { class: "field" }, label, helpEl(f));
+    const cb = label.querySelector("input");
+    w._collect = () => cb.checked;
+    w._key = f.key;
+    return w;
+  }
+  return wrap;
+}
+
+// Render a record_array (repeatable group). Returns a wrapper exposing _collect.
+function recordArray(f, vals) {
+  const subs = f.fields || [];
+  const idKey = subs.length ? subs[0].key : null;
+  const list = el("div", {});
+  const records = Array.isArray(vals[f.key]) ? vals[f.key].slice() : [];
+
+  function addRecord(recVals) {
+    const card = el("div", { class: "record" });
+    const inputs = subs.map((sf) => {
+      const fi = fieldInput(sf, recVals || {});
+      card.append(fi);
+      return fi;
+    });
+    const rm = el("button", { type: "button", class: "danger", text: "remove" });
+    rm.onclick = () => card.remove();
+    card.append(el("div", { class: "row-actions" }, rm));
+    card._collect = () => {
+      const o = {};
+      for (const fi of inputs) o[fi._key] = fi._collect();
+      return o;
+    };
+    list.append(card);
+    return card;
+  }
+
+  records.forEach((r) => addRecord(r));
+  const add = el("button", { type: "button", class: "add", text: "+ add " + f.label.toLowerCase().replace(/s$/, "") });
+  add.onclick = () => addRecord({});
+
+  const wrap = el("div", { class: "field" },
+    el("label", { text: f.label }), helpEl(f), list, add);
+  wrap._key = f.key;
+  wrap._collect = () => Array.from(list.children).map((c) => c._collect());
+  return wrap;
+}
+
+function render() {
+  $("title").textContent = (SCHEMA.title || "Plugin") + " configuration";
+  const form = $("form");
+  form.innerHTML = "";
+  if (!SCHEMA.fields || !SCHEMA.fields.length) {
+    form.append(el("p", { class: "empty", text: "No configuration required for this plugin." }));
+    $("bar").style.display = "none";
+    return;
+  }
+  const widgets = [];
+  for (const f of SCHEMA.fields) {
+    const w = f.type === "record_array" ? recordArray(f, VALUES) : fieldInput(f, VALUES);
+    widgets.push(w);
+    form.append(w);
+  }
+  form._widgets = widgets;
+  $("bar").style.display = "block";
+}
+
+function collect() {
+  const out = {};
+  for (const w of $("form")._widgets || []) out[w._key] = w._collect();
+  return out;
+}
+
+async function save() {
+  $("save").disabled = true;
+  try {
+    const res = await fetch(BASE + "/values", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(collect()),
+    });
+    if (!res.ok) throw new Error((await res.text()) || res.status);
+    const j = await res.json().catch(() => ({}));
+    if (j.restart_required) banner("warn", "Saved. Restart the feeder container for changes to take effect.");
+    else banner("ok", "Saved.");
+    // Re-fetch so secret pills reflect the new stored state.
+    await load();
+  } catch (e) {
+    banner("err", "Save failed: " + e.message);
+  } finally {
+    $("save").disabled = false;
+  }
+}
+
+async function load() {
+  const [s, v] = await Promise.all([
+    fetch(BASE + "/schema").then((r) => r.json()),
+    fetch(BASE + "/values").then((r) => r.json()),
+  ]);
+  SCHEMA = s || { fields: [] };
+  VALUES = v || {};
+  render();
+}
+
+$("save").onclick = save;
+load().catch((e) => banner("err", "Failed to load config: " + e.message));
+</script>
+</body>
+</html>

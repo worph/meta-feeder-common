@@ -1,0 +1,49 @@
+[package]
+name = "meta-feeder-sdk"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+# Source-agnostic foundation shared by the gateway core and every feeder
+# sidecar binary: the `FeederPlugin` trait, the content-addressing hash
+# families, the per-plugin redb cache, the shared HTTP/cache helpers, the
+# structured-query evaluator, and the axum `serve_feeders` harness that wraps
+# any set of `FeederPlugin`s in the feeder HTTP contract.
+#
+# Deliberately libp2p-free / blockstore-free: a feeder finds + fetches bytes;
+# the gateway core owns hashing-into-the-blockstore, the meta-core store-back,
+# and the libp2p wire. Keep heavy deps (librqbit, beetswap, cid, libp2p) OUT
+# of here so feeders that don't need them don't pay for them.
+
+[dependencies]
+# Async runtime + HTTP server (the serve_feeders harness)
+tokio = { version = "1.40", features = ["full"] }
+axum = { version = "0.7", features = ["json"] }
+hyper = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", features = ["json", "rustls-tls", "stream"], default-features = false }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+
+# Utilities
+futures = "0.3"
+async-trait = "0.1"
+anyhow = "1"
+thiserror = "1"
+tracing = "0.1"
+sha2 = "0.10"
+bytes = "1"
+# Title-tag parsing (shared filename_meta — season/episode/quality/codec/languages).
+regex = "1"
+
+# Per-plugin midhash/blob cache. Schema is identical to meta-share v1 — see
+# cache.rs. Pure-Rust single-process embedded store.
+redb = "2"
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1.40", features = ["full", "test-util"] }
