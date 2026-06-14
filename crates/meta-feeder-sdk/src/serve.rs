@@ -478,10 +478,13 @@ pub fn router(
 /// Configure each plugin (cache dir under `state_dir/gateway/<id>`), then serve
 /// the feeder HTTP contract on `listen` until shutdown.
 ///
-/// A plugin whose `configure()` returns [`ConfigError::MissingConfig`] is
-/// **soft-skipped** (warn + dropped) — mirroring the gateway registry's
-/// behaviour, so a misconfigured plugin doesn't take the whole feeder down.
-/// Any other `ConfigError` aborts startup.
+/// The feeder process never aborts on a config problem: a plugin whose
+/// `configure()` returns [`ConfigError::MissingConfig`] is **soft-skipped**
+/// (warn + dropped — an optional source the operator didn't ask for), and any
+/// other failure (bad/empty key, cache-dir setup, …) registers a
+/// [`DegradedPlugin`] that stays up and reports the reason via `/health` and
+/// `/manifest`. The container keeps running so the error is visible in the UX
+/// instead of crash-looping.
 pub async fn serve_feeders(
     plugins: Vec<Box<dyn FeederPlugin>>,
     state_dir: impl Into<PathBuf>,
@@ -503,9 +506,64 @@ pub async fn serve_feeders(
         .map_err(anyhow::Error::from)
 }
 
-/// Run each plugin's `configure()` against its per-plugin cache dir, applying
-/// the soft-skip rule, and return the surviving plugins keyed by `upstream_id`.
-/// Public so feeder binaries / tests can configure without serving.
+/// A plugin whose `configure()` (or cache-dir setup) failed. It stays
+/// **registered** so the failure is visible at `GET /health` (as
+/// [`PluginHealth::Degraded`]) and `GET /manifest`; any query/compute against it
+/// returns the captured reason as a permanent error. This is what keeps one
+/// misconfigured feeder from crash-looping the whole container — the operator
+/// sees the reason in the UX and fixes the config, no restart-loop required.
+struct DegradedPlugin {
+    id: &'static str,
+    reason: String,
+    file_types: &'static [&'static str],
+    content_kinds: &'static [&'static str],
+}
+
+#[async_trait::async_trait]
+impl FeederPlugin for DegradedPlugin {
+    fn upstream_id(&self) -> &'static str {
+        self.id
+    }
+
+    fn configure(&mut self, _cache_dir: &FsPath) -> Result<(), ConfigError> {
+        Ok(())
+    }
+
+    async fn handle_query(
+        &self,
+        _query: &GatewayQuery,
+        _max_results: usize,
+    ) -> Result<Vec<DiscoveryRecord>, GatewayError> {
+        Err(GatewayError::Permanent(self.reason.clone()))
+    }
+
+    async fn compute_outcomes(
+        &self,
+        _record_id: &str,
+    ) -> Result<Vec<HashOutcome>, GatewayError> {
+        Err(GatewayError::Permanent(self.reason.clone()))
+    }
+
+    fn health(&self) -> PluginHealth {
+        PluginHealth::Degraded {
+            reason: self.reason.clone(),
+        }
+    }
+
+    fn served_file_types(&self) -> &'static [&'static str] {
+        self.file_types
+    }
+
+    fn served_content_kinds(&self) -> &'static [&'static str] {
+        self.content_kinds
+    }
+}
+
+/// Run each plugin's `configure()` against its per-plugin cache dir and return
+/// the plugins keyed by `upstream_id`. Never errors on a per-plugin problem:
+/// `MissingConfig` is soft-skipped, every other failure becomes a
+/// [`DegradedPlugin`] (see [`serve_feeders`]). Public so feeder binaries /
+/// tests can configure without serving.
 pub fn configure_plugins(
     plugins: Vec<Box<dyn FeederPlugin>>,
     state_dir: &FsPath,
@@ -513,14 +571,39 @@ pub fn configure_plugins(
     let mut out: HashMap<String, Arc<dyn FeederPlugin>> = HashMap::new();
     for mut plugin in plugins {
         let id = plugin.upstream_id();
+        // Captured up front (both are `'static`, so this borrow of `plugin`
+        // ends immediately) — lets us build a DegradedPlugin without holding a
+        // borrow across `configure(&mut self)` / the move into `out`.
+        let file_types = plugin.served_file_types();
+        let content_kinds = plugin.served_content_kinds();
         let cache_dir = state_dir.join("gateway").join(id);
-        std::fs::create_dir_all(&cache_dir).map_err(|e| {
-            anyhow::anyhow!("create cache dir {} for {id}: {e}", cache_dir.display())
-        })?;
+
+        // Build (don't insert) a degraded stand-in: keeps the container up and
+        // surfaces the reason via /health instead of crash-looping.
+        let make_degraded = |reason: String| -> Arc<dyn FeederPlugin> {
+            warn!(
+                target: "meta-feeder",
+                upstream_id = id,
+                %reason,
+                "feeder plugin degraded: container stays up; error surfaced via /health"
+            );
+            Arc::new(DegradedPlugin {
+                id,
+                reason,
+                file_types,
+                content_kinds,
+            })
+        };
+
+        if let Err(e) = std::fs::create_dir_all(&cache_dir) {
+            let reason = format!("cache dir {} setup failed: {e}", cache_dir.display());
+            out.insert(id.to_string(), make_degraded(reason));
+            continue;
+        }
+
         match plugin.configure(&cache_dir) {
             Ok(()) => {
-                let id = id.to_string();
-                out.insert(id, Arc::from(plugin));
+                out.insert(id.to_string(), Arc::from(plugin));
             }
             Err(ConfigError::MissingConfig { plugin: p, what }) => {
                 warn!(
@@ -531,7 +614,9 @@ pub fn configure_plugins(
                      other plugins continue"
                 );
             }
-            Err(other) => return Err(anyhow::anyhow!(other)),
+            Err(other) => {
+                out.insert(id.to_string(), make_degraded(other.to_string()));
+            }
         }
     }
     Ok(out)
